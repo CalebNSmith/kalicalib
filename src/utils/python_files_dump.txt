@@ -1,0 +1,1950 @@
+
+# File: src/models/layers.py
+
+'''python
+# File: src/models/layers.py
+from typing import Optional, Callable, Type, Union, List
+
+import torch
+import torch.nn as nn
+from torch.functional import F
+from torch import Tensor
+
+class NLBlockND(nn.Module):
+    def __init__(self, in_channels, inter_channels=None, mode='embedded',
+                 dimension=3, bn_layer=True):
+        """Implementation of Non-Local Block with 4 different pairwise functions but doesn't include subsampling trick
+        args:
+            in_channels: original channel size (1024 in the paper)
+            inter_channels: channel size inside the block if not specifed reduced to half (512 in the paper)
+            mode: supports Gaussian, Embedded Gaussian, Dot Product, and Concatenation
+            dimension: can be 1 (temporal), 2 (spatial), 3 (spatiotemporal)
+            bn_layer: whether to add batch norm
+        """
+        super(NLBlockND, self).__init__()
+
+        assert dimension in [1, 2, 3]
+
+        if mode not in ['gaussian', 'embedded', 'dot', 'concatenate']:
+            raise ValueError('`mode` must be one of `gaussian`, `embedded`, `dot` or `concatenate`')
+
+        self.mode = mode
+        self.dimension = dimension
+
+        self.in_channels = in_channels
+        self.inter_channels = inter_channels
+
+        # the channel size is reduced to half inside the block
+        if self.inter_channels is None:
+            self.inter_channels = in_channels // 2
+            if self.inter_channels == 0:
+                self.inter_channels = 1
+
+        # assign appropriate convolutional, max pool, and batch norm layers for different dimensions
+        if dimension == 3:
+            conv_nd = nn.Conv3d
+            max_pool_layer = nn.MaxPool3d(kernel_size=(1, 2, 2))
+            bn = nn.BatchNorm3d
+        elif dimension == 2:
+            conv_nd = nn.Conv2d
+            max_pool_layer = nn.MaxPool2d(kernel_size=(2, 2))
+            bn = nn.BatchNorm2d
+        else:
+            conv_nd = nn.Conv1d
+            max_pool_layer = nn.MaxPool1d(kernel_size=(2))
+            bn = nn.BatchNorm1d
+
+        # function g in the paper which goes through conv. with kernel size 1
+        self.g = conv_nd(in_channels=self.in_channels, out_channels=self.inter_channels, kernel_size=1)
+
+        # add BatchNorm layer after the last conv layer
+        if bn_layer:
+            self.W_z = nn.Sequential(
+                    conv_nd(in_channels=self.inter_channels, out_channels=self.in_channels, kernel_size=1),
+                    bn(self.in_channels)
+                )
+            # from section 4.1 of the paper, initializing params of BN ensures that the initial state of non-local block is identity mapping
+            nn.init.constant_(self.W_z[1].weight, 0)
+            nn.init.constant_(self.W_z[1].bias, 0)
+        else:
+            self.W_z = conv_nd(in_channels=self.inter_channels, out_channels=self.in_channels, kernel_size=1)
+
+            # from section 3.3 of the paper by initializing Wz to 0, this block can be inserted to any existing architecture
+            nn.init.constant_(self.W_z.weight, 0)
+            nn.init.constant_(self.W_z.bias, 0)
+
+        # define theta and phi for all operations except gaussian
+        if self.mode == "embedded" or self.mode == "dot" or self.mode == "concatenate":
+            self.theta = conv_nd(in_channels=self.in_channels, out_channels=self.inter_channels, kernel_size=1)
+            self.phi = conv_nd(in_channels=self.in_channels, out_channels=self.inter_channels, kernel_size=1)
+
+        if self.mode == "concatenate":
+            self.W_f = nn.Sequential(
+                    nn.Conv2d(in_channels=self.inter_channels * 2, out_channels=1, kernel_size=1),
+                    nn.ReLU()
+                )
+
+    def forward(self, x):
+        """
+        args
+            x: (N, C, T, H, W) for dimension=3; (N, C, H, W) for dimension 2; (N, C, T) for dimension 1
+        """
+
+        batch_size = x.size(0)
+
+        # (N, C, THW)
+        # this reshaping and permutation is from the spacetime_nonlocal function in the original Caffe2 implementation
+        g_x = self.g(x).view(batch_size, self.inter_channels, -1)
+        g_x = g_x.permute(0, 2, 1)
+
+        if self.mode == "gaussian":
+            theta_x = x.view(batch_size, self.in_channels, -1)
+            phi_x = x.view(batch_size, self.in_channels, -1)
+            theta_x = theta_x.permute(0, 2, 1)
+            f = torch.matmul(theta_x, phi_x)
+
+        elif self.mode == "embedded" or self.mode == "dot":
+            theta_x = self.theta(x).view(batch_size, self.inter_channels, -1)
+            phi_x = self.phi(x).view(batch_size, self.inter_channels, -1)
+            theta_x = theta_x.permute(0, 2, 1)
+            f = torch.matmul(theta_x, phi_x)
+
+        elif self.mode == "concatenate":
+            theta_x = self.theta(x).view(batch_size, self.inter_channels, -1, 1)
+            phi_x = self.phi(x).view(batch_size, self.inter_channels, 1, -1)
+
+            h = theta_x.size(2)
+            w = phi_x.size(3)
+            theta_x = theta_x.repeat(1, 1, 1, w)
+            phi_x = phi_x.repeat(1, 1, h, 1)
+
+            concat = torch.cat([theta_x, phi_x], dim=1)
+            f = self.W_f(concat)
+            f = f.view(f.size(0), f.size(2), f.size(3))
+
+        if self.mode == "gaussian" or self.mode == "embedded":
+            f_div_C = F.softmax(f, dim=-1)
+        elif self.mode == "dot" or self.mode == "concatenate":
+            N = f.size(-1) # number of position in x
+            f_div_C = f / N
+
+        y = torch.matmul(f_div_C, g_x)
+
+        # contiguous here just allocates contiguous chunk of memory
+        y = y.permute(0, 2, 1).contiguous()
+        y = y.view(batch_size, self.inter_channels, *x.size()[2:])
+
+        W_y = self.W_z(y)
+        # residual connection
+        z = W_y + x
+
+        return z'''
+
+---
+
+
+# File: src/models/network.py
+
+'''python
+# File: src/models/network.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models
+from .layers import NLBlockND
+
+class DilatedBasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None, dilation=1):
+        super(DilatedBasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride,
+                               dilation=dilation, padding=dilation, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1,
+                               dilation=dilation, padding=dilation, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+class KaliCalibNet(nn.Module):
+    def __init__(self, n_keypoints):
+        super(KaliCalibNet, self).__init__()
+
+        # Load pretrained ResNet-18
+        print(f"Initializing KaliCalibNet with {n_keypoints} channels ({n_keypoints-2} grid points + ub + lb)")
+        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        print("Loaded pretrained ResNet-18")
+
+        # Initial layers
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+
+        # Encoder blocks
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = self._make_dilated_layer(resnet.layer3, 2, 128, 256, stride=2)
+        self.layer4 = self._make_dilated_layer(resnet.layer4, 4, 256, 512, stride=2)
+
+        # Non-local blocks
+        self.non_local3 = NLBlockND(256, dimension=2)  # Changed to NLBlockND and added dimension
+        self.non_local4 = NLBlockND(512, dimension=2)  # Changed to NLBlockND and added dimension
+
+        # Decoder layers - Using output_padding to ensure exact size matching
+        self.decoder1 = nn.Sequential(
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1, output_padding=0),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True)
+        )
+
+        self.decoder2 = nn.Sequential(
+            nn.ConvTranspose2d(256 + 256, 128, kernel_size=4, stride=2, padding=1, output_padding=0),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )
+
+        self.decoder3 = nn.Sequential(
+            nn.ConvTranspose2d(128 + 128, 64, kernel_size=4, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+
+        self.decoder4 = nn.Sequential(
+            nn.ConvTranspose2d(64 + 64, n_keypoints + 1, kernel_size=1, stride=1, padding=0)
+        )
+
+    def _make_dilated_layer(self, layer, dilation, in_channels, out_channels, stride=1):
+        """
+        Convert a regular ResNet layer to use dilated convolutions
+        using the DilatedBasicBlock.
+        """
+        downsample = None
+        if stride != 1 or in_channels != out_channels * DilatedBasicBlock.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels * DilatedBasicBlock.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels * DilatedBasicBlock.expansion),
+            )
+
+        dilated_layer = nn.Sequential(
+            DilatedBasicBlock(in_channels, out_channels, stride=stride, dilation=dilation, downsample=downsample),
+            DilatedBasicBlock(out_channels, out_channels, dilation=dilation)
+        )
+        return dilated_layer
+
+    def forward(self, x):
+        # Initial convolutions
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        # Encoder path with skip connections
+        e1 = self.layer1(x)
+        e2 = self.layer2(e1)
+        e3 = self.layer3(e2)
+        e3 = self.non_local3(e3)
+        e4 = self.layer4(e3)
+        e4 = self.non_local4(e4)
+
+        # Decoder path with skip connections
+        d1 = self.decoder1(e4)
+        if d1.shape[2:] != e3.shape[2:]:
+            d1 = F.interpolate(d1, size=e3.shape[2:], mode='bilinear', align_corners=True)
+        d1_cat = torch.cat([d1, e3], dim=1)
+        d2 = self.decoder2(d1_cat)
+        if d2.shape[2:] != e2.shape[2:]:
+            d2 = F.interpolate(d2, size=e2.shape[2:], mode='bilinear', align_corners=True)
+        d2_cat = torch.cat([d2, e2], dim=1)
+        d3 = self.decoder3(d2_cat)
+        if d3.shape[2:] != e1.shape[2:]:
+            d3 = F.interpolate(d3, size=e1.shape[2:], mode='bilinear', align_corners=True)
+        d3_cat = torch.cat([d3, e1], dim=1)
+        d4 = self.decoder4(d3_cat)
+
+        # Final softmax
+        out = F.softmax(d4, dim=1)
+
+        return out'''
+
+---
+
+
+# File: src/data/dataset.py
+
+'''python
+# File: src/data/dataset.py
+import torch
+from torch.utils.data import Dataset
+import cv2
+import numpy as np
+from pathlib import Path
+from typing import Optional, Tuple
+
+class KaliCalibDataset(Dataset):
+    """Dataset class for KaliCalib training data"""
+
+    def __init__(self,
+                data_dir: str,
+                data_prep,
+                transform=None,
+                split: str = 'train'):
+        """
+        Args:
+            data_dir: Root directory of dataset
+            data_prep: Instance of KaliCalibDataPrep
+            transform: Optional transform to be applied
+            split: One of ['train', 'val', 'test']
+        """
+        self.data_dir = Path(data_dir)
+        self.data_prep = data_prep
+        self.transform = transform
+        self.split = split
+
+        # Get all image paths
+        self.image_dir = self.data_dir / 'images'
+        self.label_dir = self.data_dir / 'labels'
+
+        self.samples = []
+        for label_path in self.label_dir.glob('*.npz'):
+            image_path = self.image_dir / f"{label_path.stem}.jpg"
+            if image_path.exists():
+                self.samples.append((str(image_path), str(label_path)))
+
+        if len(self.samples) == 0:
+            raise RuntimeError(f"Found 0 samples in {data_dir}")
+
+        # Print dataset info
+        print(f"Found {len(self.samples)} samples in {data_dir}")
+        if len(self.samples) > 0:
+            print(f"First sample - Image: {self.samples[0][0]}, Label: {self.samples[0][1]}")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_path, label_path = self.samples[idx]
+
+        # Load image
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Failed to load image: {image_path}")
+
+        # Load label data from NPZ file
+        try:
+            with np.load(label_path, allow_pickle=True) as npz_data:
+                # -- Now we have:
+                #    - 91 grid points: grid_0 ... grid_90
+                #    - ub (upper basket)
+                #    - lb (lower basket)
+                #    - background
+                #
+                # => total "foreground" channels = 91 + 2 = 93
+                # => plus 1 background = 94 total channels
+
+                n_keypoints = 93  # 91 grids + ub + lb
+                heatmap_h = image.shape[0] // self.data_prep.output_stride
+                heatmap_w = image.shape[1] // self.data_prep.output_stride
+
+                # Initialize at 1/4 resolution
+                # Channels layout:
+                #   indices [0..90]   -> grid_0..grid_90  (91 channels)
+                #   index 91         -> ub
+                #   index 92         -> lb
+                #   index 93         -> background
+                heatmap = np.zeros((n_keypoints + 1, heatmap_h, heatmap_w), dtype=np.float32)
+
+                # 1. Load grid channels
+                for i in range(91):
+                    key = f'grid_{i}'
+                    if key not in npz_data:
+                        raise KeyError(f"Missing grid point {i} in label file")
+                    grid = npz_data[key]
+                    grid_resized = cv2.resize(grid, (heatmap_w, heatmap_h))
+                    heatmap[i] = grid_resized  # i in [0..90]
+
+                # 2. Load ub (upper basket) into index 91
+                if 'ub' in npz_data:
+                    ub = npz_data['ub']
+                    ub_resized = cv2.resize(ub, (heatmap_w, heatmap_h))
+                    heatmap[91] = ub_resized
+
+                # 3. Load lb (lower basket) into index 92
+                if 'lb' in npz_data:
+                    lb = npz_data['lb']
+                    lb_resized = cv2.resize(lb, (heatmap_w, heatmap_h))
+                    heatmap[92] = lb_resized
+
+                # 4. Load background into index 93 (the last channel)
+                if 'background' in npz_data:
+                    bg = npz_data['background']
+                    bg_resized = cv2.resize(bg, (heatmap_w, heatmap_h))
+                    heatmap[93] = bg_resized
+
+        except Exception as e:
+            raise ValueError(f"Failed to load label data from {label_path}: {str(e)}")
+
+        # Apply transformations to the image
+        if self.transform:
+            image = self.transform(image)
+        else:
+            # If no transform is provided, convert to tensor here
+            # shape => (C, H, W)
+            image = torch.from_numpy(image.transpose((2, 0, 1))).float() / 255.0
+
+        # Convert heatmap to a PyTorch tensor
+        heatmap = torch.from_numpy(heatmap).float()
+
+        return image, heatmap'''
+
+---
+
+
+# File: src/data/heatmap_transforms.py
+
+'''python
+# In src/data/heatmap_transforms.py
+
+import torchvision.transforms as transforms
+import torch
+import random
+import cv2
+import numpy as np
+
+class ColorJitter:
+    def __init__(self, brightness=0.7, contrast=0.5, saturation=0.5, hue=0.5):
+        self.color_jitter = transforms.ColorJitter(
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            hue=hue
+        )
+
+    def __call__(self, image):
+        # Ensure image is in correct format for torchvision transforms
+        if isinstance(image, np.ndarray):
+            # Convert from HWC to CHW format
+            image = np.transpose(image, (2, 0, 1))
+            image = torch.from_numpy(image).float() / 255.0
+        
+        # Apply color jitter
+        image = self.color_jitter(image)
+        
+        # Convert back to numpy array in HWC format
+        if isinstance(image, torch.Tensor):
+            image = (image.numpy() * 255).astype(np.uint8)
+            image = np.transpose(image, (1, 2, 0))
+        
+        return image
+
+class RandomHorizontalFlip:
+    """Apply random horizontal flipping to image and heatmaps."""
+    def __init__(self, p=0.5):
+        self.p = p
+        self.grid_width = 13
+        self.grid_height = 7
+        
+        # Pre-compute keypoint remapping indices for efficiency
+        self.keypoint_mapping = {}
+        for y in range(self.grid_height):
+            for x in range(self.grid_width):
+                old_idx = y * self.grid_width + x
+                new_x = self.grid_width - 1 - x  # Flip x coordinate
+                new_idx = y * self.grid_width + new_x
+                self.keypoint_mapping[old_idx] = new_idx
+
+    def __call__(self, image, target=None):
+        if random.random() >= self.p:
+            return image, target
+
+        # Ensure image is numpy array in HWC format
+        if isinstance(image, torch.Tensor):
+            if image.dim() == 3:  # CHW format
+                image = image.permute(1, 2, 0)
+            image = image.numpy()
+
+        # Flip image
+        image = cv2.flip(image, 1)  # Horizontal flip
+
+        if target is None:
+            return image, None
+
+        # Handle homography matrix
+        if isinstance(target, np.ndarray) and target.shape == (3, 3):
+            flip_matrix = np.array([[-1, 0, image.shape[1]], 
+                                  [0, 1, 0], 
+                                  [0, 0, 1]])
+            target = flip_matrix @ target @ np.linalg.inv(flip_matrix)
+            return image, target
+
+        # Handle heatmap tensor
+        if isinstance(target, (torch.Tensor, np.ndarray)):
+            is_torch = isinstance(target, torch.Tensor)
+            if is_torch:
+                target = target.numpy()
+            
+            target = np.flip(target, axis=2)  # Flip spatially
+            remapped = np.zeros_like(target)
+
+            # Remap grid points (0-90)
+            for old_idx, new_idx in self.keypoint_mapping.items():
+                remapped[new_idx] = target[old_idx]
+
+            # Copy over basket points (no index remapping needed)
+            remapped[91] = target[91]  # ub
+            remapped[92] = target[92]  # lb
+            
+            # Copy background channel
+            remapped[-1] = target[-1]  # Use -1 to handle both 93 and 94 channel cases
+
+            if is_torch:
+                remapped = torch.from_numpy(remapped)
+
+            return image, remapped
+
+        raise ValueError(f"Unsupported target type: {type(target)}")'''
+
+---
+
+
+# File: src/data/data_prep.py
+
+'''python
+# src/data/data_prep.py
+import cv2
+import numpy as np
+import torch
+from torchvision import transforms
+import math
+from ..utils.court import calculate_court_points
+
+class KaliCalibDataPrep:
+    def __init__(self, config):
+        self.input_size = tuple(config['model']['input_size'])  # width, height
+        self.output_stride = config['model'].get('output_stride', 4)
+        self.output_size = (self.input_size[0] // self.output_stride,
+                           self.input_size[1] // self.output_stride)
+        self.disk_radius = config['data']['disk_radius']
+        
+        # Court dimensions
+        self.court_width = config['data']['court_width']
+        self.court_length = config['data']['court_length']
+        self.border = config['data']['border']
+        self.grid_size = tuple(config['data']['grid_size'])
+        self.n_points = self.grid_size[0] * self.grid_size[1]
+
+        # Calculate court points once during initialization
+        self._court_points, self._circle_radius, self._three_point_radius = calculate_court_points(
+            self.court_width,
+            self.court_length,
+            self.border
+        )
+
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+
+    def get_court_points(self):
+        """Return the cached court points and related dimensions."""
+        return self._court_points, self._circle_radius, self._three_point_radius
+
+    def create_disk_mask(self, center, radius):
+        """Create a disk-shaped mask centered at the given point."""
+        y, x = np.ogrid[:self.output_size[1], :self.output_size[0]]
+        dist = np.sqrt((x - center[0])**2 + (y - center[1])**2)
+        return (dist <= radius).astype(np.float32)
+
+    def generate_heatmaps(self, image, npz_data):
+        """Generate heatmaps for keypoints, bounds, and background."""
+        if image.shape[:2] != (self.input_size[1], self.input_size[0]):
+            image = cv2.resize(image, self.input_size)
+
+        normalized_image = self.transform(image)
+
+        # Initialize heatmaps array: 91 grid points + ub + lb + background = 94 channels
+        heatmaps = np.zeros((self.n_points + 3, self.output_size[1], self.output_size[0]),
+                        dtype=np.float32)
+
+        # Load all grid points (0-90)
+        for i in range(91):
+            grid_key = f'grid_{i}'
+            if grid_key in npz_data:
+                heatmaps[i] = cv2.resize(npz_data[grid_key], 
+                                    (self.output_size[0], self.output_size[1]),
+                                    interpolation=cv2.INTER_AREA)
+
+        # Load upper and lower baskets at indices 91 and 92
+        if 'ub' in npz_data:
+            heatmaps[91] = cv2.resize(npz_data['ub'],
+                                    (self.output_size[0], self.output_size[1]),
+                                    interpolation=cv2.INTER_AREA)
+        if 'lb' in npz_data:
+            heatmaps[92] = cv2.resize(npz_data['lb'],
+                                    (self.output_size[0], self.output_size[1]),
+                                    interpolation=cv2.INTER_AREA)
+
+        # Load background at index 93
+        if 'background' in npz_data:
+            heatmaps[93] = cv2.resize(npz_data['background'],
+                                    (self.output_size[0], self.output_size[1]),
+                                    interpolation=cv2.INTER_AREA)
+
+        return normalized_image, torch.from_numpy(heatmaps)
+
+    def transform_point(self, point, homography):
+        """Transform a point using homography matrix."""
+        x, y = point
+        p = np.array([x, y, 1.0])
+        p_transformed = homography @ p
+        x_transformed = p_transformed[0] / p_transformed[2]
+        y_transformed = p_transformed[1] / p_transformed[2]
+        return (int(round(x_transformed)), int(round(y_transformed)))
+
+    def generate_grid_points(self, w0=32):
+        """Generate grid points for keypoint detection."""
+        # Available space for sampling
+        available_height = self.court_width - 2 * self.border
+        available_width = self.court_length - 2 * self.border
+
+        # Number of rows and columns
+        N_rows = self.grid_size[0]
+        N_cols = self.grid_size[1]
+
+        points = []
+
+        # Generate y-coordinates (rows)
+        if N_rows < 2:
+            y_coords = [int(round(self.court_width - self.border))]
+        else:
+            y_step = available_height / (N_rows - 1)
+            y_coords = [
+                int(round(self.border + row_idx * y_step))
+                for row_idx in range(N_rows)
+            ]
+
+        # Generate x-coordinates (columns)
+        if N_cols < 2:
+            x_coords = [int(round(self.border + available_width / 2))]
+        else:
+            x_step = available_width / (N_cols - 1)
+            x_coords = [
+                int(round(self.border + col_idx * x_step))
+                for col_idx in range(N_cols)
+            ]
+
+        # Build the full grid
+        for y in y_coords:
+            for x in x_coords:
+                points.append((x, y))
+
+        return points'''
+
+---
+
+
+# File: src/training/losses.py
+
+'''python
+import torch
+import torch.nn as nn
+import logging
+
+def _neg_loss(pred, gt):
+    ''' Modified focal loss. Exactly the same as CornerNet.
+        Runs faster and costs a little bit more memory
+    Arguments:
+        pred (batch x c x h x w)
+        gt_regr (batch x c x h x w)
+    '''
+    pos_inds = gt.eq(1).float()
+    neg_inds = gt.lt(1).float()
+
+    neg_weights = torch.pow(1 - gt, 4)
+
+    pos_loss = torch.log(pred) * torch.pow(1 - pred, 2) * pos_inds
+    neg_loss = torch.log(1 - pred) * torch.pow(pred, 2) * neg_weights * neg_inds
+
+    num_pos  = pos_inds.float().sum()
+    pos_loss = pos_loss.sum()
+    neg_loss = neg_loss.sum()
+
+    if num_pos == 0:
+        loss = -neg_loss
+    else:
+        loss = -(pos_loss + neg_loss) / num_pos
+
+    return loss
+
+class FocalLoss(nn.Module):
+    '''nn.Module warpper for focal loss'''
+    def __init__(self):
+        super(FocalLoss, self).__init__()
+        self.neg_loss = _neg_loss
+
+    def forward(self, out, target):
+        return self.neg_loss(out, target)
+
+class KeypointsCrossEntropyLoss(nn.Module):
+    def __init__(self, weights):
+        super(KeypointsCrossEntropyLoss, self).__init__()
+        self.weights = weights.view(-1, 1, 1)  # Reshape weights for broadcasting: (C, 1, 1)
+
+    def forward(self, out, target):
+        """Forward pass with broadcasting-aware operations.
+        
+        Args:
+            out: Model output tensor (B, C, H, W)
+            target: Target heatmap tensor (B, C, H, W)
+        Returns:
+            Weighted cross entropy loss
+        """
+        # Add small epsilon to prevent log(0)
+        eps = 1e-8
+        out_safe = out.clamp(min=eps)
+        
+        # Compute log predictions
+        log_pred = torch.log(out_safe)  # (B, C, H, W)
+        
+        # weights is now (C, 1, 1) and will broadcast correctly
+        weighted_log_pred = target * log_pred * self.weights  # (B, C, H, W)
+        
+        # Sum over all dimensions
+        loss = -torch.sum(weighted_log_pred)
+        
+        # Normalize by batch size
+        loss = loss / out.size(0)
+        
+        return loss
+
+# class KeypointsCrossEntropyLoss(nn.Module):
+#     def __init__(self, weights):
+#         super(KeypointsCrossEntropyLoss, self).__init__()
+#         self.weights = weights
+
+#     def forward(self, out, target):
+#         """Forward pass with detailed debugging."""
+#         # logging.info("[DEBUG] Inside KeypointsCrossEntropyLoss forward")
+#         # logging.info(f"[DEBUG] Input tensor stats - out: shape={out.shape}, "
+#         #             f"min={out.min().item():.4f}, max={out.max().item():.4f}, "
+#         #             f"mean={out.mean().item():.4f}")
+#         # logging.info(f"[DEBUG] Target tensor stats: shape={target.shape}, "
+#         #             f"min={target.min().item():.4f}, max={target.max().item():.4f}, "
+#         #             f"mean={target.mean().item():.4f}")
+        
+#         # Check for any invalid values in input
+#         if torch.isnan(out).any() or torch.isinf(out).any():
+#             #logging.error("[DEBUG] ❌ Invalid values in prediction tensor (before log)")
+#             return torch.tensor(float('nan'), device=out.device)
+            
+#         # Add small epsilon to prevent log(0)
+#         eps = 1e-8
+#         out_safe = out.clamp(min=eps)
+        
+#         # Compute loss with more granular debugging
+#         log_pred = torch.log(out_safe)
+#         # logging.info(f"[DEBUG] Log predictions stats: min={log_pred.min().item():.4f}, "
+#         #             f"max={log_pred.max().item():.4f}, mean={log_pred.mean().item():.4f}")
+        
+#         weighted_log_pred = target * log_pred * self.weights
+#         # logging.info(f"[DEBUG] Weighted predictions stats: "
+#         #             f"min={weighted_log_pred.min().item():.4f}, "
+#         #             f"max={weighted_log_pred.max().item():.4f}, "
+#         #             f"mean={weighted_log_pred.mean().item():.4f}")
+        
+#         loss = -torch.sum(weighted_log_pred)
+#         #logging.info(f"[DEBUG] Final loss value: {loss.item():.4f}")
+        
+#         return loss
+'''
+
+---
+
+
+# File: src/utils/court.py
+
+'''python
+import math
+import cv2
+import numpy as np
+
+def prepare_point_pairs(label_data, image_width, image_height, court_points):
+    """
+    For each labeled point in `label_data`, if the point name is in `court_points`,
+    pair up the (x,y) in image pixels with the court coordinate system (court_points).
+    Returns two arrays:
+      - src_points: the points in the image (pixel) space
+      - dst_points: the corresponding points in the 'court' space
+    """
+    src_pts = []
+    dst_pts = []
+
+    # label_data might be something like: 
+    # {
+    #   "points": {
+    #       "ubl": {"x": 0.05, "y": 0.03},
+    #       "ubr": {"x": 0.95, "y": 0.03},
+    #       ...
+    #   }
+    # }
+    for point_name, point_data in label_data["points"].items():
+        if point_name in court_points:
+            # Convert normalized coords (0..1) to pixel coords
+            px = int(point_data["x"] * image_width)
+            py = int(point_data["y"] * image_height)
+
+            # Court-space point
+            cx, cy = court_points[point_name]
+
+            src_pts.append([px, py])
+            dst_pts.append([cx, cy])
+
+    # Convert lists to float32 NumPy arrays for cv2.findHomography
+    src_pts = np.array(src_pts, dtype=np.float32)
+    dst_pts = np.array(dst_pts, dtype=np.float32)
+
+    return src_pts, dst_pts
+
+
+def draw_court_lines(image, homography, court_points, circle_radius, three_point_radius):
+    """
+    Draw standard basketball court lines onto 'image', based on the specified 'homography'.
+    Uses 'transform_point' (already defined in this file) to reproject each point.
+    """
+    lines = [
+        ('ubl', 'lbl'),
+        ('lbl', 'lbr'),
+        ('lbr', 'ubr'),
+        ('ubr', 'ubl'),
+        ('ml', 'mr'),
+        ('ubml', 'ukl'),
+        ('ubmr', 'ukr'),
+        ('lbml', 'lkl'),
+        ('lbmr', 'lkr'),
+        ('ukl', 'ukr'),
+        ('lkl', 'lkr'),
+        ('u3bl', 'u3l'),
+        ('u3br', 'u3r'),
+        ('l3bl', 'l3l'),
+        ('l3br', 'l3r'),
+        ('ubml', 'ubl'),
+        ('ubmr', 'ubr'),
+        ('lbml', 'lbl'),
+        ('lbmr', 'lbr')
+    ]
+    
+    # 1. Straight lines
+    for start_label, end_label in lines:
+        start_point = court_points[start_label]
+        end_point = court_points[end_label]
+        start_transformed = transform_point(start_point, homography)
+        end_transformed = transform_point(end_point, homography)
+        cv2.line(image, start_transformed, end_transformed, (0, 0, 0), 5)
+    
+    # 2. 3-point arcs (upper and lower)
+    for basket_label, start_label, end_label in [('ub', 'u3l', 'u3r'), ('lb', 'l3l', 'l3r')]:
+        basket_center = court_points[basket_label]
+        arc_points = []
+        num_points = 30
+
+        start_point = court_points[start_label]
+        end_point = court_points[end_label]
+        
+        start_angle = math.atan2(start_point[1] - basket_center[1], start_point[0] - basket_center[0])
+        end_angle = math.atan2(end_point[1] - basket_center[1], end_point[0] - basket_center[0])
+        
+        # Adjust angles so we move in a consistent direction
+        if basket_label == 'ub':
+            if end_angle < start_angle:
+                end_angle += 2 * math.pi
+        else:  # 'lb'
+            if start_angle < end_angle:
+                start_angle += 2 * math.pi
+
+        for i in range(num_points + 1):
+            t = i / num_points
+            angle = start_angle * (1 - t) + end_angle * t
+            x = basket_center[0] + three_point_radius * math.cos(angle)
+            y = basket_center[1] + three_point_radius * math.sin(angle)
+            point_transformed = transform_point((x, y), homography)
+            arc_points.append(point_transformed)
+
+        cv2.polylines(image, [np.array(arc_points)], False, (0, 0, 0), 5)
+    
+    # 3. Center circle
+    center = court_points['cc']
+    circle_points = []
+    num_points = 36
+    
+    for i in range(num_points):
+        angle = 2 * math.pi * i / num_points
+        x = center[0] + circle_radius * math.cos(angle)
+        y = center[1] + circle_radius * math.sin(angle)
+        point_transformed = transform_point((x, y), homography)
+        circle_points.append(point_transformed)
+    
+    cv2.polylines(image, [np.array(circle_points)], True, (0, 0, 0), 5)
+
+
+def draw_keypoints(image, homography, court_points):
+    """
+    Draw each labeled court keypoint onto 'image' based on the homography.
+    """
+    for point_name, point in court_points.items():
+        transformed_point = transform_point(point, homography)
+        cv2.circle(image, transformed_point, 5, (0, 0, 255), -1)
+        cv2.putText(image, point_name,
+                    (transformed_point[0] + 5, transformed_point[1] + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+def calculate_court_points(court_width, court_length, border):
+    """
+    Calculate standard court points in court coordinate system.
+    All dimensions in tenths of feet.
+    
+    Returns:
+        Dictionary of point names to (x, y) coordinates
+    """
+    # Convert measurements to tenths of feet (matches ground truth dimensions)
+    corner_3pt_from_baseline = int((9 + 10/12 + 3/8/12) * 10)  # 9'10⅜" from baseline
+    corner_3pt_from_sideline = int((40.125/12) * 10)  # 40⅛" from sideline
+    key_width = 12 * 10  # 12' key width
+    key_height = 19 * 10  # 19' key height
+    circle_radius = 6 * 10  # 6' radius
+    three_point_radius = int((22 + 1/12 + 3/4/12) * 10)  # 22'1¾"
+    basket_offset = int((5 + 3/12) * 10)  # 5'3" from baseline
+    baseline_mark_distance = 19 * 10  # 19' from corners
+    sideline_mark_distance = 28 * 10  # 28' from baseline
+    sideline_mark_inset = 3 * 10  # 3' in from sideline
+    line_depth = int(8/12 * 10)  # 8 inches deep
+    dist_from_baseline = int((3 + 1/12) * 10)  # 3'1" from baseline
+    inward_dist = int(12/12 * 10)  # 12" inward
+
+    # Additional marking distances
+    additional_marks = [
+        7 * 10,           # 7 feet
+        8 * 10,           # 8 feet
+        int((11 + 1/12) * 10), # 11'1"
+        int((14 + 3/12) * 10), # 14'3"
+        int((17 + 5/12) * 10)  # 17'5"
+    ]
+
+    # Calculate peak distance for 3-point line (5'3" + 22'1¾")
+    peak_distance = int((5 + 3/12 + 22 + 1/12 + 3/4/12) * 10)
+    
+    # Center court coordinates for convenience
+    center_x = border + court_length//2
+    center_y = border + court_width//2
+    
+    # Initialize points dictionary with existing points
+    points = {
+        # [Previous points remain the same]
+        'ubl': (border, border),  # upper baseline left
+        'ubr': (border, border + court_width),  # upper baseline right
+        'u3l': (border + corner_3pt_from_baseline, border + corner_3pt_from_sideline),  # upper 3pt left
+        'u3r': (border + corner_3pt_from_baseline, border + court_width - corner_3pt_from_sideline),  # upper 3pt right
+        'u3p': (border + peak_distance, border + court_width//2),  # upper 3pt peak
+        'u3bl': (border, border + corner_3pt_from_sideline),  # upper 3pt baseline left
+        'u3br': (border, border + court_width - corner_3pt_from_sideline),  # upper 3pt baseline right
+        'ukl': (border + key_height, border + (court_width - key_width)//2),  # upper key left
+        'ukr': (border + key_height, border + (court_width + key_width)//2),  # upper key right
+        'cc': (center_x, center_y),  # center court
+        'ml': (center_x, border),  # midline left
+        'mr': (center_x, border + court_width),  # midline right
+        'lbl': (border + court_length, border),  # lower baseline left
+        'lbr': (border + court_length, border + court_width),  # lower baseline right
+        'l3l': (border + court_length - corner_3pt_from_baseline, border + corner_3pt_from_sideline),  # lower 3pt left
+        'l3r': (border + court_length - corner_3pt_from_baseline, border + court_width - corner_3pt_from_sideline),  # lower 3pt right
+        'l3p': (border + court_length - peak_distance, border + court_width//2),  # lower 3pt peak
+        'l3bl': (border + court_length, border + corner_3pt_from_sideline),  # lower 3pt baseline left
+        'l3br': (border + court_length, border + court_width - corner_3pt_from_sideline),  # lower 3pt baseline right
+        'lkl': (border + court_length - key_height, border + (court_width - key_width)//2),  # lower key left
+        'lkr': (border + court_length - key_height, border + (court_width + key_width)//2),  # lower key right
+        'ub': (border + basket_offset, border + court_width//2),  # upper basket
+        'lb': (border + court_length - basket_offset, border + court_width//2),  # lower basket
+        'ubml': (border, border + baseline_mark_distance),  # upper baseline mark left
+        'ubmr': (border, border + court_width - baseline_mark_distance),  # upper baseline mark right
+        'lbml': (border + court_length, border + baseline_mark_distance),  # lower baseline mark left
+        'lbmr': (border + court_length, border + court_width - baseline_mark_distance),  # lower baseline mark right
+        'cct': (center_x, center_y - circle_radius),  # center circle top
+        'ccb': (center_x, center_y + circle_radius),  # center circle bottom
+        'ccl': (center_x - circle_radius, center_y),  # center circle left
+        'ccr': (center_x + circle_radius, center_y),  # center circle right
+        'usml': (border + sideline_mark_distance, border + sideline_mark_inset),  # upper sideline mark left
+        'usmr': (border + court_length - sideline_mark_distance, border + sideline_mark_inset),  # upper sideline mark right
+        'usml_side': (border + sideline_mark_distance, border),  # upper sideline mark left intersection
+        'usmr_side': (border + court_length - sideline_mark_distance, border),  # upper sideline mark right intersection
+        'up1': (border + int(48/12 * 10), border + court_width - baseline_mark_distance - int(30/12 * 10)),  # upper point 1
+        'up2': (border + int(48/12 * 10), border + baseline_mark_distance + int(30/12 * 10)),  # upper point 2
+        'lp1': (border + court_length - int(48/12 * 10), border + court_width - baseline_mark_distance - int(30/12 * 10)),  # lower point 1
+        'lp2': (border + court_length - int(48/12 * 10), border + baseline_mark_distance + int(30/12 * 10))  # lower point 2
+    }
+
+    # Add corner markers with 3'1" offset and 12" inward distance
+    # Upper Right quadrant
+    points['ur_outer'] = (points['ubmr'][0] + inward_dist, points['ubmr'][1] + dist_from_baseline)
+    points['ur_inner'] = (points['ubmr'][0], points['ubmr'][1] + dist_from_baseline)
+
+    # Upper Left quadrant
+    points['ul_outer'] = (points['ubml'][0] + inward_dist, points['ubml'][1] - dist_from_baseline)
+    points['ul_inner'] = (points['ubml'][0], points['ubml'][1] - dist_from_baseline)
+
+    # Lower Right quadrant
+    points['lr_outer'] = (points['lbmr'][0] - inward_dist, points['lbmr'][1] + dist_from_baseline)
+    points['lr_inner'] = (points['lbmr'][0], points['lbmr'][1] + dist_from_baseline)
+
+    # Lower Left quadrant
+    points['ll_outer'] = (points['lbml'][0] - inward_dist, points['lbml'][1] - dist_from_baseline)
+    points['ll_inner'] = (points['lbml'][0], points['lbml'][1] - dist_from_baseline)
+
+    # Add the new baseline mark points
+    for i, distance in enumerate(additional_marks):
+        # Upper baseline mark points with line depth
+        y_base = border + court_width - baseline_mark_distance
+        points[f'ubm_right_{i}'] = (border + distance, y_base + line_depth)
+        points[f'ubm_right_base_{i}'] = (border + distance, y_base)
+        
+        y_base = border + baseline_mark_distance
+        points[f'ubm_left_{i}'] = (border + distance, y_base - line_depth)
+        points[f'ubm_left_base_{i}'] = (border + distance, y_base)
+        
+        # Lower baseline mark points with line depth
+        y_base = border + court_width - baseline_mark_distance
+        points[f'lbm_right_{i}'] = (border + court_length - distance, y_base + line_depth)
+        points[f'lbm_right_base_{i}'] = (border + court_length - distance, y_base)
+        
+        y_base = border + baseline_mark_distance
+        points[f'lbm_left_{i}'] = (border + court_length - distance, y_base - line_depth)
+        points[f'lbm_left_base_{i}'] = (border + court_length - distance, y_base)
+    
+    return points, circle_radius, three_point_radius
+
+def transform_point(point, homography):
+    """
+    Transform a point using homography matrix.
+    
+    Args:
+        point: Tuple of (x, y) coordinates
+        homography: 3x3 homography matrix
+    
+    Returns:
+        Tuple of transformed (x, y) coordinates
+    """
+    # Convert to homogeneous coordinates
+    x, y = point
+    p = np.array([x, y, 1.0])
+    
+    # Apply homography
+    p_transformed = homography @ p
+    
+    # Convert back from homogeneous coordinates
+    x_transformed = p_transformed[0] / p_transformed[2]
+    y_transformed = p_transformed[1] / p_transformed[2]
+    
+    return (int(round(x_transformed)), int(round(y_transformed)))
+
+def generate_perspective_aware_grid_points(court_width, court_length, border, grid_size, w0_meters=1.75):
+    """Generate grid points with perspective-aware sampling."""
+    available_height = court_width - 2 * border
+    available_width = court_length - 2 * border
+    n_rows = grid_size[0]
+    n_cols = grid_size[1]
+    points = []
+
+    # Generate y-coordinates (rows) with perspective-aware spacing
+    if n_rows < 2:
+        y_coords = [border + available_height // 2]
+    else:
+        base = 1.5  # Controls how quickly points spread out
+        y_coords = []
+        for i in range(n_rows):
+            t = i / (n_rows - 1)  # goes from 0 to 1
+            y_normalized = (pow(base, t) - 1) / (base - 1)
+            y = int(round(border + y_normalized * available_height))
+            y_coords.append(y)
+
+    # Generate x-coordinates (columns) with even spacing
+    if n_cols < 2:
+        x_coords = [border + available_width // 2]
+    else:
+        x_step = available_width / (n_cols - 1)
+        x_coords = [int(round(border + col_idx * x_step)) for col_idx in range(n_cols)]
+
+    # Build the full grid
+    for y in y_coords:
+        for x in x_coords:
+            points.append((x, y))
+
+    return points
+'''
+
+---
+
+
+# File: src/utils/visualization.py
+
+'''python
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+def visualize_heatmaps(image, heatmaps, alpha=0.5):
+    """
+    Visualize keypoint heatmaps overlaid on the original image.
+    
+    Args:
+        image: Original image (H, W, 3)
+        heatmaps: Heatmaps tensor (K+1, H, W)
+        alpha: Transparency of heatmap overlay
+    
+    Returns:
+        Visualization image with heatmap overlay
+    """
+    # Skip background channel (index 0)
+    combined_heatmap = np.max(heatmaps[1:], axis=0)
+    
+    # Resize heatmap to match image size
+    heatmap_resized = cv2.resize(
+        combined_heatmap,
+        (image.shape[1], image.shape[0])
+    )
+    
+    # Apply colormap
+    heatmap_colored = cv2.applyColorMap(
+        (heatmap_resized * 255).astype(np.uint8),
+        cv2.COLORMAP_JET
+    )
+    
+    # Overlay heatmap on image
+    return cv2.addWeighted(image, 1 - alpha, heatmap_colored, alpha, 0)
+
+def visualize_keypoints(image, points, homography, radius=5, color=(0, 0, 255)):
+    """
+    Visualize keypoints on the original image.
+    
+    Args:
+        image: Original image
+        points: List of (x, y) points in court coordinates
+        homography: Homography matrix
+        radius: Radius of keypoint circles
+        color: Color of keypoint circles (BGR)
+    
+    Returns:
+        Image with keypoints drawn
+    """
+    vis_img = image.copy()
+    
+    for point in points:
+        # Transform point using homography
+        transformed_point = transform_point(point, homography)
+        
+        # Draw circle at point
+        cv2.circle(vis_img, transformed_point, radius, color, -1)
+    
+    return vis_img
+
+def plot_training_progress(losses, save_path=None):
+    """
+    Plot training loss curve.
+    
+    Args:
+        losses: List of loss values
+        save_path: Optional path to save plot
+    """
+    plt.figure(figsize=(10, 5))
+    plt.plot(losses)
+    plt.title('Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.grid(True)
+    
+    if save_path:
+        plt.savefig(save_path)
+    plt.close()
+'''
+
+---
+
+
+# File: scripts/train.py
+
+'''python
+#!/usr/bin/env python
+
+import os
+import sys
+import argparse
+import yaml
+import logging
+from pathlib import Path
+import numpy as np
+from datetime import datetime
+
+import torch
+import torch.optim as optim
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+# Add the project root to the Python path (so we can import src.*)
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+# ---- Import your modules ----
+from src.models.network import KaliCalibNet
+from src.training.losses import KeypointsCrossEntropyLoss
+from src.data.dataset import KaliCalibDataset
+from src.data.data_prep import KaliCalibDataPrep
+from src.data.heatmap_transforms import ColorJitter, RandomHorizontalFlip
+
+###############################################################################
+# Utility functions
+###############################################################################
+
+class ComposeTransforms:
+    """Composes multiple transforms together, handling both image and target transforms."""
+    def __init__(self, transforms):
+        self.transforms = transforms
+
+    def __call__(self, image, target=None):
+        for t in self.transforms:
+            if hasattr(t, '__call__'):
+                # If the transform accepts both image & target, call it that way
+                if 'target' in t.__call__.__code__.co_varnames:
+                    image, target = t(image, target)
+                else:
+                    image = t(image)
+        
+        # Ensure final image is in torch tensor format (CHW)
+        if isinstance(image, np.ndarray):
+            image = torch.from_numpy(np.transpose(image, (2, 0, 1))).float() / 255.0
+        elif isinstance(image, torch.Tensor) and image.dim() == 3 and image.shape[0] not in (1,3):
+            # If tensor but in HWC format, convert to CHW
+            image = image.permute(2, 0, 1)
+        
+        return image if target is None else (image, target)
+
+def create_timestamped_dir(base_dir):
+    """Create a timestamped directory within the base directory."""
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    timestamped_dir = Path(base_dir) / timestamp
+    timestamped_dir.mkdir(parents=True, exist_ok=True)
+    return timestamped_dir
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    """
+    Run one epoch of training on the entire training set.
+    Returns the average loss over this epoch.
+    """
+    model.train()
+    total_loss = 0.0
+    for batch_idx, (images, heatmaps) in enumerate(dataloader):
+        images = images.to(device)       # shape (B, 3, H, W)
+        heatmaps = heatmaps.to(device)   # shape (B, K+1, H/4, W/4), if output_stride=4
+
+        optimizer.zero_grad()
+        outputs = model(images)          # shape (B, K+1, H/4, W/4)
+        loss = criterion(outputs, heatmaps)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+    
+    avg_loss = total_loss / len(dataloader)
+    return avg_loss
+
+@torch.no_grad()
+def evaluate(model, dataloader, criterion, device):
+    """
+    Evaluate model on validation set.
+    Returns the average validation loss.
+    """
+    model.eval()
+    total_val_loss = 0.0
+    for images, heatmaps in dataloader:
+        images = images.to(device)
+        heatmaps = heatmaps.to(device)
+
+        outputs = model(images)
+        loss = criterion(outputs, heatmaps)
+        total_val_loss += loss.item()
+    
+    avg_loss = total_val_loss / len(dataloader)
+    return avg_loss
+
+###############################################################################
+# Main
+###############################################################################
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train KaliCalibNet on full dataset")
+    parser.add_argument('--config', type=str, required=True,
+                        help='Path to a YAML config file (e.g. configs/default.yaml)')
+    parser.add_argument('--data-dir', type=str, required=True,
+                        help='Root directory containing train/ and val/ subfolders with images/ and labels/')
+    parser.add_argument('--output-dir', type=str, default='outputs/train_runs',
+                        help='Directory to save checkpoints and logs')
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='Number of DataLoader workers')
+
+    # -------------------------------------------------------------------------
+    # Optional overrides for YAML values:
+    # (Feel free to add or remove any as needed)
+    # -------------------------------------------------------------------------
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='Override training.batch_size in YAML')
+    parser.add_argument('--learning-rate', type=float, default=None,
+                        help='Override training.learning_rate in YAML')
+    parser.add_argument('--n-epochs', type=int, default=None,
+                        help='Override training.n_epochs in YAML')
+    parser.add_argument('--lr-decay-epoch', type=int, default=None,
+                        help='Override training.lr_decay_epoch in YAML')
+    parser.add_argument('--keypoint-weight', type=float, default=None,
+                        help='Override training.keypoint_weight in YAML')
+    parser.add_argument('--background-weight', type=float, default=None,
+                        help='Override training.background_weight in YAML')
+
+    return parser.parse_args()
+
+def create_transforms(config, split='train'):
+    """Create transform pipeline based on config and split type."""
+    if split == 'train':
+        # Get augmentation config with defaults
+        aug_config = config.get('augmentation', {})
+        color_config = aug_config.get('color_jitter', {})
+
+        transforms_list = [
+            ColorJitter(
+                brightness=color_config.get('brightness', 0.7),
+                contrast=color_config.get('contrast', 0.5),
+                saturation=color_config.get('saturation', 0.5),
+                hue=color_config.get('hue', 0.5)
+            ),
+            RandomHorizontalFlip(
+                p=aug_config.get('random_flip_prob', 0.5)
+            )
+        ]
+        return ComposeTransforms(transforms_list)
+    else:
+        # No augmentations for validation
+        return None
+
+def main():
+    args = parse_args()
+
+    # ---------------------------------------------------------------------
+    # 1. Create timestamped output directory
+    # ---------------------------------------------------------------------
+    run_dir = create_timestamped_dir(args.output_dir)
+    
+    # ---------------------------------------------------------------------
+    # 2. Load config from YAML
+    # ---------------------------------------------------------------------
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+
+    # ---------------------------------------------------------------------
+    # 3. Override YAML values with CLI arguments (if provided)
+    # ---------------------------------------------------------------------
+    if args.batch_size is not None:
+        config['training']['batch_size'] = args.batch_size
+
+    if args.learning_rate is not None:
+        config['training']['learning_rate'] = args.learning_rate
+
+    if args.n_epochs is not None:
+        config['training']['n_epochs'] = args.n_epochs
+
+    if args.lr_decay_epoch is not None:
+        config['training']['lr_decay_epoch'] = args.lr_decay_epoch
+
+    if args.keypoint_weight is not None:
+        config['training']['keypoint_weight'] = args.keypoint_weight
+
+    if args.background_weight is not None:
+        config['training']['background_weight'] = args.background_weight
+
+    # ---------------------------------------------------------------------
+    # 4. Initialize Logging
+    # ---------------------------------------------------------------------
+    logging.basicConfig(
+        filename=str(run_dir / 'training.log'),
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s: %(message)s'
+    )
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    logging.getLogger().addHandler(console)
+
+    # Print final config at the start of training
+    logging.info("============  TRAINING START  ============")
+    logging.info(f"Loaded base config from {args.config}")
+    logging.info(f"Data root: {args.data_dir}")
+    logging.info(f"Outputs will be saved to {run_dir}")
+    logging.info("==== Final Merged Configuration ====")
+    logging.info("\n" + yaml.dump(config, sort_keys=False))
+    logging.info("====================================")
+
+    # ---------------------------------------------------------------------
+    # 5. Prepare Data (train + val)
+    # ---------------------------------------------------------------------
+    data_prep = KaliCalibDataPrep(config)
+
+    train_dir = os.path.join(args.data_dir, "train")
+    val_dir = os.path.join(args.data_dir, "val")
+
+    train_transforms = create_transforms(config, split='train')
+    val_transforms = create_transforms(config, split='val')
+
+    train_dataset = KaliCalibDataset(
+        data_dir=train_dir,
+        data_prep=data_prep,
+        transform=train_transforms,
+        split='train'
+    )
+    val_dataset = KaliCalibDataset(
+        data_dir=val_dir,
+        data_prep=data_prep,
+        transform=val_transforms,
+        split='val'
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['training'].get('batch_size', 2),
+        shuffle=True,
+        num_workers=args.num_workers,
+        drop_last=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['training'].get('batch_size', 2),
+        shuffle=False,
+        num_workers=args.num_workers
+    )
+
+    # ---------------------------------------------------------------------
+    # 6. Initialize Model
+    # ---------------------------------------------------------------------
+    n_keypoints = config['model']['n_keypoints']  # e.g. 93
+    model = KaliCalibNet(n_keypoints)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    logging.info("Initialized KaliCalibNet model.")
+
+    # ---------------------------------------------------------------------
+    # 7. Create Loss & Optimizer
+    # ---------------------------------------------------------------------
+    key_wt = config['training'].get('keypoint_weight', 50)
+    bg_wt = config['training'].get('background_weight', 1)
+
+    weights = torch.ones(n_keypoints + 1, device=device) * key_wt
+    weights[-1] = bg_wt  # last channel is background
+    criterion = KeypointsCrossEntropyLoss(weights=weights)
+
+    learning_rate = config['training'].get('learning_rate', 1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    lr_decay_epoch = config['training'].get('lr_decay_epoch', None)
+
+    # ---------------------------------------------------------------------
+    # 8. Training Loop
+    # ---------------------------------------------------------------------
+    n_epochs = config['training'].get('n_epochs', 100)
+    logging.info(f"Starting training for {n_epochs} epochs.")
+
+    best_val_loss = float('inf')
+    for epoch in range(1, n_epochs + 1):
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+
+        if lr_decay_epoch is not None and epoch == lr_decay_epoch:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= 0.1
+            logging.info(f"LR decayed to {optimizer.param_groups[0]['lr']} at epoch {epoch}")
+
+        val_loss = evaluate(model, val_loader, criterion, device)
+
+        logging.info(f"[Epoch {epoch:03d}/{n_epochs}] "
+                     f"Train Loss: {train_loss:.6f} | "
+                     f"Val Loss: {val_loss:.6f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_path = run_dir / 'best_model.pth'
+            torch.save(model.state_dict(), save_path)
+            logging.info(f"  ** New best val loss. Model saved to {save_path}")
+
+    logging.info("Training complete. Best val loss = {:.6f}".format(best_val_loss))
+    logging.info("============  TRAINING END  ============")
+
+if __name__ == "__main__":
+    main()'''
+
+---
+
+
+# File: configs/default.yaml
+
+'''
+# Model configuration
+model:
+  n_keypoints: 93  # 7x13 + ub + lb grid points
+  input_size: [1920, 1080]  # width, height
+  output_stride: 4
+
+# Training configuration
+training:
+  n_epochs: 200
+  batch_size: 2
+  learning_rate: 0.0001
+  lr_decay_epoch: 66  # 2/3 of total epochs
+  keypoint_weight: 10
+  background_weight: 1
+  detailed_logging_epoch: 500
+  activation_logging_epoch: 500
+
+# Data configuration
+data:
+  court_width: 500   # 50 feet in tenths
+  court_length: 940  # 94 feet in tenths
+  border: 0         # 8 inches
+  grid_size: [7, 13] # rows, cols
+  disk_radius: 5    # radius for keypoint heatmaps
+
+# Augmentation configuration
+augmentation:
+  color_jitter:
+    brightness: 0.7
+    contrast: 0.5
+    saturation: 0.5
+    hue: 0.5
+  random_flip_prob: 0.5
+
+# Evaluation configuration
+evaluation:
+  visualize: true
+  save_predictions: true
+  metrics:
+    - mse
+    - detection_rate'''
+
+---
+
+
+# File: scripts/inference.py
+
+'''python
+import os
+import sys
+import argparse
+from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import cv2
+
+# Add the project root to the Python path
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from src.models.network import KaliCalibNet
+from src.data.data_prep import KaliCalibDataPrep
+
+def visualize_keypoints(image, keypoints, threshold=0.5, title=None):
+    """Visualize keypoints on the image."""
+    # Handle image conversion to correct format for matplotlib
+    if isinstance(image, torch.Tensor):
+        img = image.cpu().numpy().transpose(1, 2, 0)
+    else:
+        if image.shape[2] == 3:  
+            img = image
+        else:  
+            img = image.transpose(1, 2, 0)
+        
+    if img.max() > 1.0:
+        img = img / 255.0
+    
+    plt.figure(figsize=(12, 8))
+    plt.imshow(img)
+    if title:
+        plt.title(title)
+    
+    # Convert keypoints to numpy if needed
+    if isinstance(keypoints, torch.Tensor):
+        keypoints = keypoints.cpu().numpy()
+    
+    # Plot grid points (indices 0-90)
+    for k in range(91):
+        hmap = keypoints[k]
+        if hmap.max() > threshold:
+            y, x = np.unravel_index(hmap.argmax(), hmap.shape)
+            x = x * 4  # Scale back to original image size
+            y = y * 4
+            plt.plot(x, y, 'r.', markersize=10)
+            plt.text(x+5, y+5, f'grid_{k}', color='white', 
+                    bbox=dict(facecolor='red', alpha=0.5))
+    
+    # Plot upper bound points (index 91)
+    hmap = keypoints[91]
+    if hmap.max() > threshold:
+        y, x = np.unravel_index(hmap.argmax(), hmap.shape)
+        x = x * 4
+        y = y * 4
+        plt.plot(x, y, 'b.', markersize=10)
+        plt.text(x+5, y+5, 'ub', color='white',
+                bbox=dict(facecolor='blue', alpha=0.5))
+
+    # Plot lower bound points (index 92)
+    hmap = keypoints[92]
+    if hmap.max() > threshold:
+        y, x = np.unravel_index(hmap.argmax(), hmap.shape)
+        x = x * 4
+        y = y * 4
+        plt.plot(x, y, 'g.', markersize=10)
+        plt.text(x+5, y+5, 'lb', color='white',
+                bbox=dict(facecolor='green', alpha=0.5))
+    
+    plt.axis('off')
+    return plt.gcf()
+
+def load_and_preprocess_image(image_path, data_prep):
+    """Load and preprocess a single image for inference."""
+    image = cv2.imread(image_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    if image.shape[:2] != (data_prep.input_size[1], data_prep.input_size[0]):
+        image = cv2.resize(image, data_prep.input_size)
+    
+    processed_image = image.copy()
+    image_tensor = data_prep.transform(image)
+    image_tensor = image_tensor.unsqueeze(0)
+    return image_tensor, processed_image
+
+def load_ground_truth(image_path, data_prep):
+    """Load ground truth keypoints from NPZ file."""
+    label_path = Path(str(image_path).replace('/images/', '/labels/').replace('.jpg', '.npz'))
+    
+    if not label_path.exists():
+        print(f"Ground truth file not found: {label_path}")
+        return None
+        
+    print(f"Loading ground truth from: {label_path}")
+    npz_data = np.load(label_path)
+    ground_truth = np.zeros((93, data_prep.output_size[1], data_prep.output_size[0]), dtype=np.float32)
+
+    # Load grid points
+    for i in range(91):
+        grid_key = f'grid_{i}'
+        if grid_key in npz_data:
+            heatmap = npz_data[grid_key]
+            ground_truth[i] = cv2.resize(heatmap, 
+                                    (data_prep.output_size[0], data_prep.output_size[1]),
+                                    interpolation=cv2.INTER_AREA)
+    
+    # Load upper and lower baskets
+    for idx, key in enumerate(['ub', 'lb']):
+        if key in npz_data:
+            heatmap = npz_data[key]
+            ground_truth[91 + idx] = cv2.resize(heatmap,
+                                    (data_prep.output_size[0], data_prep.output_size[1]),
+                                    interpolation=cv2.INTER_AREA)
+    
+    return ground_truth
+
+def run_inference(model_path, image_path, output_dir, config_path=None):
+    """Run inference and generate two visualizations: predictions and ground truth."""
+    # Create output directory
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Initialize data preparation
+    if config_path:
+        import yaml
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        data_prep = KaliCalibDataPrep(config)
+    else:
+        data_prep = KaliCalibDataPrep({})
+    
+    # Load and preprocess image
+    image_tensor, processed_image = load_and_preprocess_image(image_path, data_prep)
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    image_tensor = image_tensor.to(device)
+    
+    # Load model and run inference
+    model = KaliCalibNet(n_keypoints=93)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model = model.to(device)
+    model.eval()
+    
+    with torch.no_grad():
+        predictions = model(image_tensor)[0]
+    
+    # Load ground truth
+    ground_truth = load_ground_truth(image_path, data_prep)
+    
+    # Generate filenames
+    input_filename = Path(image_path).stem
+    
+    # Save prediction visualization
+    fig_pred = visualize_keypoints(processed_image, predictions, title="Predicted Keypoints")
+    pred_path = output_dir / f'{input_filename}_pred.png'
+    fig_pred.savefig(pred_path, bbox_inches='tight', pad_inches=0)
+    plt.close(fig_pred)
+    print(f"Saved prediction visualization to: {pred_path}")
+    
+    # Save ground truth visualization if available
+    if ground_truth is not None:
+        fig_gt = visualize_keypoints(processed_image, ground_truth, title="Ground Truth Keypoints")
+        gt_path = output_dir / f'{input_filename}_gt.png'
+        fig_gt.savefig(gt_path, bbox_inches='tight', pad_inches=0)
+        plt.close(fig_gt)
+        print(f"Saved ground truth visualization to: {gt_path}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate separate visualizations for predictions and ground truth")
+    parser.add_argument('--model', type=str, required=True,
+                        help='Path to trained model weights')
+    parser.add_argument('--image', type=str, required=True,
+                        help='Path to input image')
+    parser.add_argument('--output-dir', type=str, required=True,
+                        help='Directory to save output visualizations')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Optional path to config file')
+    
+    args = parser.parse_args()
+    run_inference(args.model, args.image, args.output_dir, args.config)
+
+if __name__ == "__main__":
+    main()'''
+
+---
+
+
+# File: scripts/generate_single_heatmap.py
+
+'''python
+import argparse
+import json
+import cv2
+import numpy as np
+from pathlib import Path
+import yaml
+import sys, os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from src.utils.court import calculate_court_points, transform_point, generate_perspective_aware_grid_points
+
+def create_binary_mask(height, width, points, radius=10):
+    """
+    Create a binary mask from point locations.
+    
+    Args:
+        height (int): Image height
+        width (int): Image width
+        points (np.ndarray): Array of (row, col) point coordinates
+        radius (int): Radius of the circular mask around each point
+        
+    Returns:
+        np.ndarray: Binary mask where 1s indicate foreground regions
+    """
+    mask = np.zeros((height, width), dtype=np.uint8)
+    
+    for row, col in points:
+        cv2.circle(mask, (int(col), int(row)), radius, 1, -1)
+    
+    return mask
+
+def generate_binary_heatmaps(image_path, label_path, config_path='configs/default.yaml', resize=False, 
+                           output_dir=None, label_output=None, image_output=None):
+    """
+    Generates dense binary masks for keypoints and background using perspective-aware sampling.
+
+    Args:
+        image_path (str): Path to the image file.
+        label_path (str): Path to the JSON label file.
+        config_path (str): Path to the configuration YAML file.
+        resize (bool): Whether to resize the image to 960x540.
+        output_dir (str, optional): Directory to save all outputs (NPZ and visualizations).
+        label_output (str, optional): Path to save NPZ file.
+        image_output (str, optional): Path to save processed image.
+    """
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    data_prep_config = config['data']
+    model_config = config['model']
+
+    court_width = data_prep_config['court_width']
+    court_length = data_prep_config['court_length']
+    border = data_prep_config['border']
+    grid_size = tuple(data_prep_config['grid_size'])
+
+    # Load and potentially resize the image
+    image = cv2.imread(image_path)
+    if image is None:
+        raise FileNotFoundError(f"Could not read image at: {image_path}")
+    
+    original_height, original_width = image.shape[:2]
+    
+    if resize:
+        target_width, target_height = 960, 540
+        image = cv2.resize(image, (target_width, target_height))
+        scale_x = target_width / original_width
+        scale_y = target_height / original_height
+    else:
+        target_width, target_height = original_width, original_height
+        scale_x = scale_y = 1.0
+
+    with open(label_path, 'r') as f:
+        label_data = json.load(f)
+
+    # Calculate court points
+    court_points_dict, _, _ = calculate_court_points(court_width, court_length, border)
+
+    # Generate perspective-aware grid points in court coordinates
+    grid_points_coords = generate_perspective_aware_grid_points(court_width, court_length, border, grid_size)
+    print(f"Generated {len(grid_points_coords)} grid points")
+
+    # Explicit keypoints in court coordinates
+    explicit_keypoints_coords = {
+        'ub': (border + int(5.25 * 10), border + court_width // 2),  # Upper basket
+        'lb': (border + court_length - int(5.25 * 10), border + court_width // 2)  # Lower basket
+    }
+
+    # Get point correspondences for homography, adjusting for resize if necessary
+    src_points = []
+    dst_points = []
+    for point_name, point_data in label_data['points'].items():
+        if point_name in court_points_dict:
+            # Scale the points if image was resized
+            src_points.append([
+                point_data['x'] * target_width,
+                point_data['y'] * target_height
+            ])
+            dst_points.append(court_points_dict[point_name])
+
+    if len(src_points) < 4:
+        raise ValueError(f"Need at least 4 point correspondences to calculate homography, got {len(src_points)}")
+
+    homography, _ = cv2.findHomography(np.float32(dst_points), np.float32(src_points))
+    if homography is None:
+        raise ValueError("Could not compute homography.")
+
+    all_masks = {}
+    
+    # Process grid points
+    for i, court_point in enumerate(grid_points_coords):
+        transformed_point = transform_point(court_point, homography)
+        locations = []
+        if 0 <= transformed_point[1] < target_height and 0 <= transformed_point[0] < target_width:
+            locations.append(transformed_point[::-1])  # Store as (row, col)
+        mask = create_binary_mask(target_height, target_width, np.array(locations))
+        all_masks[f'grid_{i}'] = mask
+
+    # Process explicit keypoints
+    for name, court_point in explicit_keypoints_coords.items():
+        transformed_point = transform_point(court_point, homography)
+        locations = []
+        if 0 <= transformed_point[1] < target_height and 0 <= transformed_point[0] < target_width:
+            locations.append(transformed_point[::-1])  # Store as (row, col)
+        mask = create_binary_mask(target_height, target_width, np.array(locations))
+        all_masks[name] = mask
+
+    # Create background mask (inverse of all other masks combined)
+    combined_mask = np.zeros((target_height, target_width), dtype=np.uint8)
+    for mask in all_masks.values():
+        combined_mask = cv2.bitwise_or(combined_mask, mask)
+    all_masks['background'] = 1 - combined_mask
+
+    # Handle outputs based on provided arguments
+    if output_dir:
+        # Create output directory
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        # Save visualizations
+        for name, mask in all_masks.items():
+            viz = image.copy()
+            viz[mask == 1] = [203, 192, 255]  # Pink tint for foreground
+            viz_output_file = output_path / f"{Path(label_path).stem}_{name}_mask_visualization.jpg"
+            cv2.imwrite(str(viz_output_file), viz)
+            print(f"Mask visualization for {name} saved to: {viz_output_file}")
+
+        # Save NPZ
+        output_file = output_path / f"{Path(label_path).stem}_binary_masks.npz"
+        np.savez_compressed(output_file, **all_masks)
+        print(f"Binary masks saved to: {output_file}")
+    
+    else:
+        # Save NPZ to specified label output path
+        Path(label_output).parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(label_output, **all_masks)
+        print(f"Binary masks saved to: {label_output}")
+        
+        # Save processed image to specified image output path
+        Path(image_output).parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(image_output, image)
+        print(f"Processed image saved to: {image_output}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate binary masks from image and label.")
+    parser.add_argument("--image", required=True, help="Path to the image file.")
+    parser.add_argument("--label", required=True, help="Path to the JSON label file.")
+    parser.add_argument("--config", type=str, default='configs/default.yaml', help="Path to the configuration YAML file.")
+    parser.add_argument("--resize", action="store_true", help="Resize image to 960x540")
+    
+    # Create mutually exclusive group for output options
+    output_group = parser.add_mutually_exclusive_group(required=True)
+    output_group.add_argument("--output-dir", help="Directory to save all outputs (NPZ and visualizations)")
+    output_group.add_argument("--label-output", help="Path to save NPZ file", metavar="PATH")
+    
+    # Make image-output required if label-output is provided
+    parser.add_argument("--image-output", help="Path to save processed image", metavar="PATH")
+
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if args.label_output and not args.image_output:
+        parser.error("--image-output is required when using --label-output")
+    if args.image_output and not args.label_output:
+        parser.error("--label-output is required when using --image-output")
+
+    generate_binary_heatmaps(
+        image_path=args.image,
+        label_path=args.label,
+        config_path=args.config,
+        resize=args.resize,
+        output_dir=args.output_dir,
+        label_output=args.label_output,
+        image_output=args.image_output
+    )
+
+if __name__ == "__main__":
+    main()'''
+
+---
+

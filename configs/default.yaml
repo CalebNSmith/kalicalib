@@ -1,0 +1,41 @@
+# Model configuration
+model:
+  n_keypoints: 93  # 7x13 + ub + lb grid points
+  input_size: [1920, 1080]  # width, height
+  output_stride: 4
+
+# Training configuration
+training:
+  n_epochs: 200
+  batch_size: 2
+  learning_rate: 0.0001
+  lr_decay_epoch: 66  # 2/3 of total epochs
+  keypoint_weight: 10
+  background_weight: 1
+  detailed_logging_epoch: 500
+  activation_logging_epoch: 500
+
+# Data configuration
+data:
+  court_width: 500   # 50 feet in tenths
+  court_length: 940  # 94 feet in tenths
+  border: 0         # 8 inches
+  grid_size: [7, 13] # rows, cols
+  disk_radius: 5    # radius for keypoint heatmaps
+
+# Augmentation configuration
+augmentation:
+  color_jitter:
+    brightness: 0.7
+    contrast: 0.5
+    saturation: 0.5
+    hue: 0.5
+  random_flip_prob: 0.5
+
+# Evaluation configuration
+evaluation:
+  visualize: true
+  save_predictions: true
+  metrics:
+    - mse
+    - detection_rate
