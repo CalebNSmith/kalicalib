@@ -185,7 +185,7 @@ python scripts/train.py \
 - `--keypoint-weight`
 - `--background-weight`
 
-At the end, a `best_model.pth` will be saved (and possibly a final `model.pth` if you adapt the script).
+At the end, a `best_model.pth` will be saved.
 
 ---
 
