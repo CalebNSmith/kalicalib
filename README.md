@@ -231,10 +231,10 @@ This script will:
 7. Save the resulting visualizations in `outputs/inference/`.
 
 ### Successful Homogrpahy
-![Successful inference showing accurate court point detection and homography estimation](./images/successful_inference.jpg)
+![](./images/successful_inference.jpg)
 
 ### Degenerate Homography
-![Unsuccessful inference where the model fails to properly detect court points due to occlusion](./images/unsuccessful_inference.jpg)
+![](./images/unsuccessful_inference.jpg)
 
 **Note on Detecting Degenerate Cases to Improve Training:** 
 When the model produces a degenerate homography like the one shown above, we can detect this automatically by leveraging our knowledge of basketball court geometry. By reprojecting the midpoint of each half-court into court space and measuring the distance between them, we can identify likely failures. If this distance falls below a certain threshold, it indicates that points are incorrectly clustering together, which is a signature of degenerate homography estimation. These can then be added to a queue of images that need to be labeled.
