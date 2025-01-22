@@ -37,7 +37,7 @@ This repository includes:
 ## Project Overview
 
 **KaliCalibNet** uses a ResNet-18 backbone, modified with dilated convolutions and optional Non-Local Blocks for capturing longer-range dependencies in the spatial dimension. It is designed to:
-1. Ingest an RGB image of a basketball court (e.g. from overhead or angled camera).
+1. Ingest an RGB image of a basketball court.
 2. Predict a (K+1)-channel heatmap, where each channel corresponds to:
    - 91 grid point positions (perspective-aware or uniformly spaced),
    - 1 channel for the upper basket (UB),
