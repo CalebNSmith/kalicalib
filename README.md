@@ -3,6 +3,8 @@
 KaliCalibNet is a neural network model for basketball court calibration and keypoint (grid + baskets) detection.  
 It is **an implementation** of the architecture presented in [KaliCalib: A Framework for Basketball Court Registration](https://arxiv.org/abs/2209.07795) by Adrien Maglo, Astrid Orcesi, and Quoc Cuong Pham.
 
+This is part of a larger project to get more advanced analytics for smaller college basketball programs. I am particuarly focused on the Division II Mountain East Conference. 
+
 ### Example output
 ![](./images/successful_inference.jpg)
 
@@ -42,33 +44,6 @@ This repository includes:
    - 1 channel for the lower basket (LB),
    - and 1 for the background.
 3. Enable further homography-based transformations to register the court with real-world coordinates.
-
----
-
-## Installation & Environment Setup
-
-1. **Clone the Repository:**
-
-   ```bash
-   git clone https://github.com/yourusername/KaliCalibNet.git
-   cd KaliCalibNet
-   ```
-
-2. **Create a Conda Environment (Optional):**
-
-   ```bash
-   conda create -n kalicalib python=3.9 -y
-   conda activate kalicalib
-   ```
-
-3. **Install Dependencies:**
-
-   This project uses PyTorch, OpenCV, and a few other libraries listed in `requirements.txt` or required by scripts.  
-   You can install them via pip:
-
-   ```bash
-   pip install -r requirements.txt
-   ```
 
 ---
 
