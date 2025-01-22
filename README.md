@@ -108,6 +108,8 @@ I have a separate custom labeling system consisting of a Python backend for serv
    - Labels are exported as JSON files containing the keypoint correspondences
    - These JSON files are then processed using `generate_single_heatmap.py` to create the `.npz` binary masks needed for training
 
+![](./images/label_example.gif)
+
 [![Watch the video](https://img.shields.io/badge/Watch-Video-red?logo=youtube)](https://www.youtube.com/watch?v=KOa1tu5nza0)
 
 ---
