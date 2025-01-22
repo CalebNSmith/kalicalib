@@ -3,7 +3,7 @@
 KaliCalibNet is a neural network model for basketball court calibration and keypoint (grid + baskets) detection.  
 It is **an implementation** of the architecture presented in [KaliCalib: A Framework for Basketball Court Registration](https://arxiv.org/abs/2209.07795) by Adrien Maglo, Astrid Orcesi, and Quoc Cuong Pham.
 
-This is part of a larger project to get more advanced analytics for smaller college basketball programs. I am particuarly focused on the Division II Mountain East Conference. 
+My implementation is part of a larger project to get more advanced analytics for smaller college basketball programs. I am particuarly focused on the Division II Mountain East Conference. 
 
 ### Example output
 ![](./images/successful_inference.jpg)
